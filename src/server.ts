@@ -1,10 +1,12 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { CalculationRepository } from './persistence/repository';
+import type { PrescriptionRepository } from './prescription/repository';
 import { registerRoutes } from './routes';
 import { ValidationError } from './validation';
 
 export interface BuildServerOptions {
   repository: CalculationRepository;
+  prescriptionRepository: PrescriptionRepository;
   logger?: boolean;
 }
 
@@ -40,6 +42,6 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     });
   });
 
-  registerRoutes(app, options.repository);
+  registerRoutes(app, options.repository, options.prescriptionRepository);
   return app;
 }

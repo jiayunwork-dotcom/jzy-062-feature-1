@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { InMemoryCalculationRepository } from '../src/persistence/memory';
+import { InMemoryPrescriptionRepository } from '../src/prescription/memory';
 import { buildServer } from '../src/server';
 import {
   CLASSROOM_EXAMPLE,
@@ -8,7 +9,8 @@ import {
 import type { CalculationRecord } from '../src/types';
 
 const repository = new InMemoryCalculationRepository();
-const app = buildServer({ repository });
+const prescriptionRepository = new InMemoryPrescriptionRepository();
+const app = buildServer({ repository, prescriptionRepository });
 
 afterAll(async () => {
   await app.close();
