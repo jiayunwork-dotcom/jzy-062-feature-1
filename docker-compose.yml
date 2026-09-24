@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: acoustics
+      POSTGRES_PASSWORD: acoustics
+      POSTGRES_DB: acoustics
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acoustics -d acoustics"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATABASE_URL: postgres://acoustics:acoustics@db:5432/acoustics
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+volumes:
+  db-data:
