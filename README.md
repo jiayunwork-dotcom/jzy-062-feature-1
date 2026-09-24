@@ -79,6 +79,65 @@ from an untreated curve.
 Invalid geometry (negative neck length, non-positive neck area or cavity
 volume, non-integer count) is rejected with structured reasons.
 
+### Goal-driven inverse solver ([`src/prescription/solver.ts`](src/prescription/solver.ts))
+
+The forward kernel only answers "given materials, what is the T60?". The
+inverse solver answers the studio question "given target T60 values, what
+must I add?". It is a pure search/conversion layer wrapped around the
+**unmodified** forward modules:
+
+- no physical constants or reverberation formulas are redeclared — every
+  trial is scored by calling `computeAcoustics`;
+- resonator geometry is inverted by bisecting the cavity volume against
+  `buildResonator`, so the end correction, temperature-consistent speed of
+  sound, tuning frequency and Lorentzian Q all keep their single source;
+- the final prescription is independently verified by rebuilding the
+  treated scheme and re-running the complete forward calculation — the
+  returned `verification` block is that fresh result, not a promise.
+
+Targets are sparse: any subset of the six octave bands may carry a target
+T60 (seconds); unpinned bands impose no hard requirement. Added absorption
+can only shorten T60, so a band whose baseline already lies at or below the
+upper tolerance edge needs nothing (a target *longer* than the current T60
+yields an empty prescription).
+
+Two convertible prescription types:
+
+1. **Surface** — raise the coefficient of named, existing candidate
+   surfaces to one common feasible level per pinned band, via monotone
+   bisection. The level is the smallest that enters the tolerance band and
+   is physically capped at 1. If saturating every candidate at 1 still
+   leaves a band over its upper edge, the band is reported unreachable
+   (`surface-coefficient-ceiling`) with the best achievable T60.
+2. **Resonator** — design one resonator unit per deficient band (neck
+   geometry from a template, cavity tuned by the solver) and search the
+   integer group counts. The forward model makes the effective Sabine /
+   Eyring denominator **linear** in every count, with the Lorentzian tails
+   forming a positive spillover matrix `G`:
+
+   ```
+   D_j(n) = D0_j + Σ_i n_i · G[i][j],
+   L_j = KV / (T·(1+tol)) ≤ D_j ≤ KV / (T·(1−tol)) = U_j.
+   ```
+
+   Phase 1 raises counts until every lower denominator bound is met
+   (groups for one band add positive tails to neighbouring bands — the
+   coupling is included, not ignored); phase 2 removes units only while no
+   band re-opens a lower-bound gap. Failure is reported honestly, with the
+   physical reason: `resonator-group-cap`, `resonator-spillover` (a band
+   cannot be relieved without re-opening another) or
+   `resonator-quantization` (integer group granularity at tight
+   tolerances). Counts are never negative and never exceed the configured
+   cap.
+
+`strategy` is `surface`, `resonator` (caller preference) or `auto`
+(surface first; when its coefficient ceiling proves insufficient the
+solver records the failed attempt and falls back to resonators).
+
+Every solve, including unreachable ones, is persisted for the same audit
+trail as ordinary calculations. The solver holds no module-level state, so
+concurrent requests cannot share intermediate state.
+
 ## API
 
 Base URL: `http://localhost:3000`
@@ -92,6 +151,9 @@ Base URL: `http://localhost:3000`
 | POST | `/api/v1/calculations` | validate, compute, persist; returns the record |
 | GET | `/api/v1/calculations` | list recent records (`?limit=`, ≤ 500) |
 | GET | `/api/v1/calculations/:id` | fetch one record (404 with error body if unknown) |
+| POST | `/api/v1/prescriptions` | goal-driven inverse solve, forward-verified and persisted |
+| GET | `/api/v1/prescriptions` | list recent prescription solves (`?limit=`, ≤ 500) |
+| GET | `/api/v1/prescriptions/:id` | fetch one prescription (404 with error body if unknown) |
 
 ### Request body (POST /api/v1/calculations)
 
@@ -154,6 +216,50 @@ mid-frequency Sabine T60 of roughly 0.5–0.7 s; the example resonator bank is
 tuned to f0 ≈ 500 Hz and pulls the 500 Hz band down while leaving neighbouring
 bands almost unchanged.
 
+### Prescription request (POST /api/v1/prescriptions)
+
+```json
+{
+  "room": { "...same room schema as /calculations..." },
+  "resonators": [],
+  "targets": { "500": 0.6, "1000": 0.6 },
+  "toleranceRatio": 0.05,
+  "model": "sabine",
+  "preferences": {
+    "strategy": "auto",
+    "candidateSurfaceNames": ["ceiling (hard plaster)", "walls (block + paint)"],
+    "resonatorTemplate": { "neckArea": 0.002, "neckLength": 0.02, "temperatureC": 20 },
+    "maxResonatorGroups": 2000
+  }
+}
+```
+
+Rules: `targets` maps any non-empty subset of octave bands to a **positive**
+target T60 in seconds (missing bands are unpinned); `toleranceRatio` is the
+half-width as a fraction of target, default 0.05, allowed
+[0, 0.5]; `model` is `sabine` (default) or `eyring`; `strategy` is `surface`,
+`resonator` or `auto` (default); `candidateSurfaceNames` must reference
+surfaces that exist in the submitted room and is required for `surface` and
+`auto`; `resonatorTemplate` (optional) fixes the neck geometry and
+temperature while the solver tunes the cavity volume; `maxResonatorGroups`
+(default 2000) is a positive integer cap per tuned band.
+
+Responses:
+
+- `201` with the prescription record: `status` (`already-compliant`,
+  `solved`, `unreachable`), `strategyUsed`, `fallbackUsed`, per-target
+  status (`within-tolerance`, `already-better-than-target`, `unreachable`,
+  `over-treated`) and the additional absorption each target demands, the
+  `prescription` (surface coefficient levels / resonator groups with a
+  ready-to-submit resonator each), the complete `verification` forward
+  run, `attempts` audit notes, and solver counters.
+- `422 TARGET_UNREACHABLE` for a well-formed but physically impossible
+  request: the body carries `unreachableDetails` (limitation + best
+  achievable T60 per band) and the full persisted `record`.
+- `400 VALIDATION_ERROR` with the same structured field/reason shape as
+  `/calculations` (non-positive targets, out-of-range tolerance, unknown
+  candidate surfaces, bad group caps, invalid template geometry, …).
+
 ## Modules
 
 | Module | Responsibility |
@@ -162,13 +268,17 @@ bands almost unchanged.
 | `src/validation.ts` | material/geometry/resonator validation, structured errors |
 | `src/acoustics.ts` | Sabine + Eyring kernel, dc / fs derivation |
 | `src/helmholtz.ts` | resonator physics (L_eff, f0, Lorentzian band absorption) |
-| `src/persistence/` | repository port + PostgreSQL 16 and in-memory adapters |
+| `src/prescription/solver.ts` | goal-driven inverse search & prescription conversion (forward kernel reused unchanged) |
+| `src/prescription/errors.ts` | unreachable-target error carrying the audited solve record |
+| `src/persistence/` | repository ports + PostgreSQL 16 and in-memory adapters |
 | `src/server.ts` / `src/routes.ts` | Fastify wiring |
-| `src/examples/classroom.ts` | preset classroom example |
+| `src/examples/classroom.ts`, `src/examples/liveStudio.ts` | preset examples |
 
 The calculation core is pure and stateless; each submission is persisted as
 its own record (room row + calculation row in one transaction), so concurrent
-room schemes never bleed into each other.
+room schemes never bleed into each other. The prescription solver is likewise
+stateless — every solve builds its own room clones, resonator banks and search
+counters, and each prescription is persisted in its own transaction.
 
 ## Running with Docker
 
@@ -209,6 +319,27 @@ The suite locks the required causal invariants:
 - resonator results are recomputed from the new total absorption (T60 = 0.161·V/A_total with A_total including ΔA);
 - invalid geometry and out-of-range coefficients are rejected with structured reasons;
 - concurrent submissions stay isolated and are individually retrievable.
+
+The inverse-solver suite additionally locks:
+
+- a live room pinned to a shorter mid-band target receives a surface or
+  resonator prescription whose complete forward re-run lands the pinned
+  band inside its tolerance band (Sabine and Eyring);
+- a target at or above the current T60 returns an empty prescription — no
+  absorption is invented;
+- an impossibly short target is reported `unreachable` with the best
+  achievable T60, never an out-of-range coefficient or a negative /
+  over-cap group count;
+- multi-band resonator prescriptions account for Lorentzian spillover so
+  every pinned band is inside its band simultaneously;
+- `auto` falls back to resonators only after the surface coefficient
+  ceiling is proven insufficient, recording both attempts;
+- the carried `verification` equals an independent `computeAcoustics`
+  call on the treated scheme, and the submitted room is never mutated;
+- non-positive targets, out-of-range tolerance, unknown / duplicate
+  candidate surfaces, bad group caps and invalid resonator templates are
+  rejected with structured field/reason errors;
+- parallel solves stay isolated, each retrievable by its own id.
 
 A PostgreSQL integration test runs when `TEST_DATABASE_URL` is set:
 

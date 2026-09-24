@@ -1,17 +1,23 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { InMemoryCalculationRepository } from '../src/persistence/memory';
+import {
+  InMemoryCalculationRepository,
+  InMemoryPrescriptionRepository,
+} from '../src/persistence/memory';
 import { buildServer } from '../src/server';
 import {
   CLASSROOM_EXAMPLE,
   CLASSROOM_RESONATOR_EXAMPLE,
 } from '../src/examples/classroom';
-import type { CalculationRecord } from '../src/types';
+import { LIVE_STUDIO_EXAMPLE } from '../src/examples/liveStudio';
+import type { CalculationRecord, PrescriptionRecord } from '../src/types';
 
 const repository = new InMemoryCalculationRepository();
-const app = buildServer({ repository });
+const prescriptionRepository = new InMemoryPrescriptionRepository();
+const app = buildServer({ repository, prescriptionRepository });
 
 afterAll(async () => {
   await app.close();
+  await prescriptionRepository.close();
 });
 
 async function postCalculation(body: unknown) {
@@ -131,6 +137,174 @@ describe('HTTP API', () => {
       expect(
         calculations[i - 1].createdAt >= calculations[i].createdAt,
       ).toBe(true);
+    }
+  });
+});
+
+describe('goal-driven prescription endpoint', () => {
+  const liveRoom = LIVE_STUDIO_EXAMPLE.room;
+
+  async function postPrescription(body: unknown) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/prescriptions',
+      payload: body as Record<string, unknown>,
+    });
+    return { status: response.statusCode, body: response.json() };
+  }
+
+  it('solves a live room target and returns the forward-verified prescription', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: 0.6 },
+      toleranceRatio: 0.05,
+      preferences: {
+        strategy: 'surface',
+        candidateSurfaceNames: ['ceiling (hard plaster)', 'walls (block + paint)'],
+      },
+    });
+    expect(status).toBe(201);
+    const record = body as PrescriptionRecord;
+    expect(record.id).toBeTruthy();
+    expect(record.result.status).toBe('solved');
+    const achieved = record.result.verification.bands.find((b) => b.frequencyHz === 500)!
+      .sabine.t60Seconds!;
+    expect(achieved).toBeGreaterThanOrEqual(0.57);
+    expect(achieved).toBeLessThanOrEqual(0.63);
+
+    // Persisted and retrievable afterwards (audit trail).
+    const fetched = await app.inject({
+      method: 'GET',
+      url: `/api/v1/prescriptions/${record.id}`,
+    });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.json()).toEqual(record);
+  });
+
+  it('returns an empty 201 prescription for a target that is already met', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: 4 },
+      toleranceRatio: 0.05,
+      preferences: { strategy: 'resonator' },
+    });
+    expect(status).toBe(201);
+    const record = body as PrescriptionRecord;
+    expect(record.result.status).toBe('already-compliant');
+    expect(record.result.prescription.resonators).toHaveLength(0);
+    expect(record.result.prescription.surfaceTreatments).toHaveLength(0);
+  });
+
+  it('returns a structured 422 (with the persisted record) for an unreachable target', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: 0.05 },
+      toleranceRatio: 0.02,
+      preferences: { strategy: 'resonator', maxResonatorGroups: 10 },
+    });
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('TARGET_UNREACHABLE');
+    expect(body.error.details[0]!.frequencyHz).toBe(500);
+    // The record — including best achievable — rides along and was persisted.
+    const record = body.record as PrescriptionRecord;
+    expect(record.result.status).toBe('unreachable');
+    expect(
+      record.result.unreachableDetails![0]!.bestAchievableT60Seconds,
+    ).toBeGreaterThan(0.05 * 1.02);
+    const fetched = await app.inject({
+      method: 'GET',
+      url: `/api/v1/prescriptions/${record.id}`,
+    });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.json().result.status).toBe('unreachable');
+  });
+
+  it('auto-falls-back to resonators when the surface ceiling is insufficient', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: 0.3 },
+      toleranceRatio: 0.05,
+      preferences: {
+        strategy: 'auto',
+        candidateSurfaceNames: ['floor (sealed concrete)'],
+      },
+    });
+    expect(status).toBe(201);
+    const record = body as PrescriptionRecord;
+    expect(record.result.status).toBe('solved');
+    expect(record.result.strategyUsed).toBe('resonator');
+    expect(record.result.fallbackUsed).toBe(true);
+    const achieved = record.result.verification.bands.find((b) => b.frequencyHz === 500)!
+      .sabine.t60Seconds!;
+    expect(achieved).toBeGreaterThanOrEqual(0.285);
+    expect(achieved).toBeLessThanOrEqual(0.315);
+  });
+
+  it('keeps multiple pinned bands simultaneously in band via resonators', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: 0.6, 1000: 0.6 },
+      toleranceRatio: 0.05,
+      preferences: { strategy: 'resonator', maxResonatorGroups: 5000 },
+    });
+    expect(status).toBe(201);
+    const record = body as PrescriptionRecord;
+    expect(record.result.status).toBe('solved');
+    for (const frequency of [500, 1000]) {
+      const t = record.result.verification.bands.find((b) => b.frequencyHz === frequency)!
+        .sabine.t60Seconds!;
+      expect(t).toBeGreaterThanOrEqual(0.57);
+      expect(t).toBeLessThanOrEqual(0.63);
+    }
+  });
+
+  it('rejects invalid prescription input with a structured 400', async () => {
+    const { status, body } = await postPrescription({
+      room: liveRoom,
+      targets: { 500: -0.6 },
+      toleranceRatio: 0.9,
+      preferences: {
+        strategy: 'surface',
+        candidateSurfaceNames: ['no such wall'],
+      },
+    });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('VALIDATION_ERROR');
+    const fields = body.error.details.map((d: { field: string }) => d.field);
+    expect(fields).toContain('targets.500');
+    expect(fields.some((f: string) => f.includes('toleranceRatio'))).toBe(true);
+    expect(fields.some((f: string) => f.includes('candidateSurfaceNames'))).toBe(true);
+  });
+
+  it('isolates parallel prescription solves from each other', async () => {
+    const payloads = [0.5, 0.7, 0.9, 1.1].map((target) => ({
+      room: structuredClone(liveRoom),
+      targets: { 500: target },
+      toleranceRatio: 0.05,
+      preferences: { strategy: 'resonator', maxResonatorGroups: 5000 },
+    }));
+    const responses = await Promise.all(payloads.map((payload) => postPrescription(payload)));
+    const records = responses.map(({ status, body }) => {
+      expect(status).toBe(201);
+      return body as PrescriptionRecord;
+    });
+    expect(new Set(records.map((r) => r.id)).size).toBe(payloads.length);
+    records.forEach((record, index) => {
+      const target = payloads[index]!.targets[500]!;
+      const t = record.result.verification.bands.find((b) => b.frequencyHz === 500)!
+        .sabine.t60Seconds!;
+      expect(t).toBeGreaterThanOrEqual(target * 0.95);
+      expect(t).toBeLessThanOrEqual(target * 1.05);
+    });
+  });
+
+  it('lists prescriptions most recent first', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/v1/prescriptions?limit=100' });
+    expect(response.statusCode).toBe(200);
+    const { count, prescriptions } = response.json();
+    expect(count).toBeGreaterThan(0);
+    for (let i = 1; i < prescriptions.length; i += 1) {
+      expect(prescriptions[i - 1].createdAt >= prescriptions[i].createdAt).toBe(true);
     }
   });
 });

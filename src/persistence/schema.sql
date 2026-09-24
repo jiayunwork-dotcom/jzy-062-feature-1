@@ -22,3 +22,14 @@ CREATE INDEX IF NOT EXISTS calculations_created_at_idx
 
 CREATE INDEX IF NOT EXISTS calculations_room_id_idx
     ON calculations (room_id);
+
+-- Audit trail for goal-driven absorption prescription solves.
+CREATE TABLE IF NOT EXISTS prescriptions (
+    id          UUID PRIMARY KEY,
+    request     JSONB NOT NULL,
+    result      JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS prescriptions_created_at_idx
+    ON prescriptions (created_at DESC);

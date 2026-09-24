@@ -1,10 +1,15 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import type { CalculationRepository } from './persistence/repository';
+import {
+  CalculationRepository,
+  PrescriptionRepository,
+} from './persistence/repository';
+import { UnreachableTargetError } from './prescription/errors';
 import { registerRoutes } from './routes';
 import { ValidationError } from './validation';
 
 export interface BuildServerOptions {
   repository: CalculationRepository;
+  prescriptionRepository: PrescriptionRepository;
   logger?: boolean;
 }
 
@@ -19,6 +24,19 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
           message: 'The request failed validation.',
           details: error.details,
         },
+      });
+    }
+    if (error instanceof UnreachableTargetError) {
+      // Physically impossible, well-formed request: the body carries the
+      // complete persisted solve including the closest achievable result.
+      return reply.status(422).send({
+        error: {
+          code: 'TARGET_UNREACHABLE',
+          message:
+            'The requested reverberation time cannot be reached within the given tolerance; see details and bestAchievable in the record.',
+          details: error.record.result.unreachableDetails ?? [],
+        },
+        record: error.record,
       });
     }
     const statusCode = (error as { statusCode?: number }).statusCode;
@@ -40,6 +58,6 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     });
   });
 
-  registerRoutes(app, options.repository);
+  registerRoutes(app, options.repository, options.prescriptionRepository);
   return app;
 }
